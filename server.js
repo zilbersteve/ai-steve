@@ -3,6 +3,7 @@ import express from "express";
 const app = express();
 
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
 const ELEVEN_API_KEY = process.env.ELEVEN_API_KEY;
 const VOICE_ID = process.env.VOICE_ID;
@@ -47,7 +48,7 @@ app.get("/audio.mp3", async (req, res) => {
   }
 });
 
-function sendTwiML(req, res) {
+function sendVoiceTwiML(req, res) {
   res.type("text/xml");
   res.send(`
     <Response>
@@ -56,8 +57,19 @@ function sendTwiML(req, res) {
   `);
 }
 
-app.get("/voice", sendTwiML);
-app.post("/voice", sendTwiML);
+app.get("/voice", sendVoiceTwiML);
+app.post("/voice", sendVoiceTwiML);
+
+app.post("/sms", (req, res) => {
+  const incoming = (req.body.Body || "").trim();
+
+  res.type("text/xml");
+  res.send(`
+    <Response>
+      <Message>hey ${incoming}</Message>
+    </Response>
+  `);
+});
 
 app.listen(process.env.PORT || 3000, () => {
   console.log("Server running");
