@@ -14,6 +14,8 @@ const {
   PORT = '3000',
   ELEVENLABS_API_KEY,
   ELEVENLABS_AGENT_ID,
+  OPENAI_API_KEY,
+  OPENAI_MEMORY_MODEL = 'gpt-4o-mini',
   TWILIO_ACCOUNT_SID,
   TWILIO_AUTH_TOKEN,
   TWILIO_PHONE_NUMBER,
@@ -24,6 +26,10 @@ const {
 
 if (!ELEVENLABS_API_KEY || !ELEVENLABS_AGENT_ID) {
   throw new Error('Missing ELEVENLABS_API_KEY or ELEVENLABS_AGENT_ID');
+}
+
+if (!OPENAI_API_KEY) {
+  throw new Error('Missing OPENAI_API_KEY');
 }
 
 if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) {
@@ -53,6 +59,21 @@ function dedupeStrings(values) {
   return [...new Set(values.map((v) => String(v).trim()).filter(Boolean))];
 }
 
+function clampInt(value, min, max) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return min;
+  return Math.max(min, Math.min(max, Math.round(n)));
+}
+
+function appendUniqueNote(existing, nextNote) {
+  const a = String(existing || '').trim();
+  const b = String(nextNote || '').trim();
+  if (!b) return a;
+  if (!a) return b;
+  if (a.toLowerCase().includes(b.toLowerCase())) return a;
+  return `${a}\n- ${b}`;
+}
+
 async function ensureTables() {
   await pool.query(`
     create table if not exists contact_memory (
@@ -62,9 +83,45 @@ async function ensureTables() {
       facts jsonb not null default '[]'::jsonb,
       open_loops jsonb not null default '[]'::jsonb,
       notes text not null default '',
+      summary text not null default '',
+      lead_status text not null default 'unknown',
+      lead_score integer not null default 0,
+      last_intent text not null default '',
+      next_action text not null default '',
+      last_extracted_at timestamptz,
       created_at timestamptz not null default now(),
       updated_at timestamptz not null default now()
     );
+  `);
+
+  await pool.query(`
+    alter table contact_memory
+      add column if not exists summary text not null default '';
+  `);
+
+  await pool.query(`
+    alter table contact_memory
+      add column if not exists lead_status text not null default 'unknown';
+  `);
+
+  await pool.query(`
+    alter table contact_memory
+      add column if not exists lead_score integer not null default 0;
+  `);
+
+  await pool.query(`
+    alter table contact_memory
+      add column if not exists last_intent text not null default '';
+  `);
+
+  await pool.query(`
+    alter table contact_memory
+      add column if not exists next_action text not null default '';
+  `);
+
+  await pool.query(`
+    alter table contact_memory
+      add column if not exists last_extracted_at timestamptz;
   `);
 
   await pool.query(`
@@ -112,7 +169,21 @@ async function getRecentMessages(phone, limit = 24) {
 async function getContactMemory(phone) {
   const result = await pool.query(
     `
-      select phone, profile, preferences, facts, open_loops, notes, created_at, updated_at
+      select
+        phone,
+        profile,
+        preferences,
+        facts,
+        open_loops,
+        notes,
+        summary,
+        lead_status,
+        lead_score,
+        last_intent,
+        next_action,
+        last_extracted_at,
+        created_at,
+        updated_at
       from contact_memory
       where phone = $1
     `,
@@ -128,6 +199,12 @@ async function getContactMemory(phone) {
       facts: row.facts || [],
       open_loops: row.open_loops || [],
       notes: row.notes || '',
+      summary: row.summary || '',
+      lead_status: row.lead_status || 'unknown',
+      lead_score: Number(row.lead_score || 0),
+      last_intent: row.last_intent || '',
+      next_action: row.next_action || '',
+      last_extracted_at: row.last_extracted_at || null,
       createdAt: row.created_at,
       updatedAt: row.updated_at,
       messages: await getRecentMessages(phone),
@@ -141,12 +218,30 @@ async function getContactMemory(phone) {
     facts: [],
     open_loops: [],
     notes: '',
+    summary: '',
+    lead_status: 'unknown',
+    lead_score: 0,
+    last_intent: '',
+    next_action: '',
+    last_extracted_at: null,
   };
 
   await pool.query(
     `
-      insert into contact_memory (phone, profile, preferences, facts, open_loops, notes)
-      values ($1, $2, $3, $4, $5, $6)
+      insert into contact_memory (
+        phone,
+        profile,
+        preferences,
+        facts,
+        open_loops,
+        notes,
+        summary,
+        lead_status,
+        lead_score,
+        last_intent,
+        next_action
+      )
+      values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
       on conflict (phone) do nothing
     `,
     [
@@ -156,6 +251,11 @@ async function getContactMemory(phone) {
       fresh.facts,
       fresh.open_loops,
       fresh.notes,
+      fresh.summary,
+      fresh.lead_status,
+      fresh.lead_score,
+      fresh.last_intent,
+      fresh.next_action,
     ]
   );
 
@@ -170,16 +270,34 @@ async function getContactMemory(phone) {
 async function saveContactMemory(memory) {
   await pool.query(
     `
-      insert into contact_memory
-        (phone, profile, preferences, facts, open_loops, notes, updated_at)
-      values
-        ($1, $2, $3, $4, $5, $6, now())
+      insert into contact_memory (
+        phone,
+        profile,
+        preferences,
+        facts,
+        open_loops,
+        notes,
+        summary,
+        lead_status,
+        lead_score,
+        last_intent,
+        next_action,
+        last_extracted_at,
+        updated_at
+      )
+      values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,now())
       on conflict (phone) do update set
         profile = excluded.profile,
         preferences = excluded.preferences,
         facts = excluded.facts,
         open_loops = excluded.open_loops,
         notes = excluded.notes,
+        summary = excluded.summary,
+        lead_status = excluded.lead_status,
+        lead_score = excluded.lead_score,
+        last_intent = excluded.last_intent,
+        next_action = excluded.next_action,
+        last_extracted_at = excluded.last_extracted_at,
         updated_at = now()
     `,
     [
@@ -189,6 +307,12 @@ async function saveContactMemory(memory) {
       memory.facts,
       memory.open_loops,
       memory.notes,
+      memory.summary || '',
+      memory.lead_status || 'unknown',
+      clampInt(memory.lead_score || 0, 0, 100),
+      memory.last_intent || '',
+      memory.next_action || '',
+      memory.last_extracted_at || null,
     ]
   );
 }
@@ -224,7 +348,7 @@ async function updateLastSeen(phone) {
   );
 }
 
-async function maybeExtractFacts(phone, userText) {
+async function heuristicExtractFacts(phone, userText) {
   const memory = await getContactMemory(phone);
   const text = String(userText || '').trim();
   if (!text) return;
@@ -271,6 +395,196 @@ async function maybeExtractFacts(phone, userText) {
   await saveContactMemory(memory);
 }
 
+function memoryPatchSchema() {
+  return {
+    name: 'memory_patch',
+    strict: true,
+    schema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        profile: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            name: { type: 'string' },
+            relationship: { type: 'string' },
+            company: { type: 'string' },
+          },
+          required: ['name', 'relationship', 'company'],
+        },
+        preferences_add: {
+          type: 'array',
+          items: { type: 'string' },
+        },
+        facts_add: {
+          type: 'array',
+          items: { type: 'string' },
+        },
+        open_loops_add: {
+          type: 'array',
+          items: { type: 'string' },
+        },
+        notes_add: { type: 'string' },
+        summary: { type: 'string' },
+        lead_status: {
+          type: 'string',
+          enum: ['unknown', 'cold', 'warm', 'hot'],
+        },
+        lead_score: { type: 'integer' },
+        last_intent: { type: 'string' },
+        next_action: { type: 'string' },
+      },
+      required: [
+        'profile',
+        'preferences_add',
+        'facts_add',
+        'open_loops_add',
+        'notes_add',
+        'summary',
+        'lead_status',
+        'lead_score',
+        'last_intent',
+        'next_action',
+      ],
+    },
+  };
+}
+
+async function callOpenAIMemoryExtractor({ phone, latestUserText }) {
+  const memory = await getContactMemory(phone);
+  const recentMessages = memory.messages
+    .slice(-12)
+    .map((m) => `${m.role === 'user' ? 'Contact' : 'Steve'}: ${m.text}`)
+    .join('\n');
+
+  const developerPrompt = `
+You update durable CRM-style memory for "Steve", a human-sounding texting agent.
+Your job is to read the latest inbound text plus recent thread context and return ONLY a structured JSON memory patch.
+
+Rules:
+- Be conservative. Do not invent personal facts.
+- Only extract facts strongly supported by the thread.
+- Keep strings short and useful.
+- If unknown, return empty strings or empty arrays.
+- "relationship" should be things like: friend, lead, client, collaborator, prospect, fan, unknown.
+- "lead_status" should reflect commercial/business warmth if applicable, otherwise unknown/cold/warm/hot.
+- "lead_score" is 0-100.
+- "last_intent" should capture the contact's immediate goal.
+- "next_action" should be the smartest short follow-up move for Steve.
+- "summary" should be a compact 1-3 sentence working memory summary.
+- "notes_add" should only contain one short durable note if something truly worth remembering appeared.
+- Do not duplicate what is already in memory unless you are refining it.
+`;
+
+  const userPrompt = `
+PHONE: ${phone}
+
+CURRENT MEMORY
+Name: ${memory.profile.name || ''}
+Relationship: ${memory.profile.relationship || ''}
+Company: ${memory.profile.company || ''}
+Preferences: ${memory.preferences.join(' | ')}
+Facts: ${memory.facts.join(' | ')}
+Open loops: ${memory.open_loops.join(' | ')}
+Notes: ${memory.notes || ''}
+Summary: ${memory.summary || ''}
+Lead status: ${memory.lead_status || 'unknown'}
+Lead score: ${memory.lead_score || 0}
+Last intent: ${memory.last_intent || ''}
+Next action: ${memory.next_action || ''}
+
+RECENT THREAD
+${recentMessages || 'No recent conversation yet.'}
+
+LATEST INBOUND MESSAGE
+${latestUserText}
+`.trim();
+
+  const resp = await fetch('https://api.openai.com/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      model: OPENAI_MEMORY_MODEL,
+      messages: [
+        { role: 'developer', content: developerPrompt },
+        { role: 'user', content: userPrompt },
+      ],
+      response_format: {
+        type: 'json_schema',
+        json_schema: memoryPatchSchema(),
+      },
+      temperature: 0.2,
+    }),
+  });
+
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`OpenAI memory extraction failed: ${resp.status} ${text}`);
+  }
+
+  const data = await resp.json();
+  const content = data?.choices?.[0]?.message?.content;
+
+  if (!content) {
+    throw new Error('OpenAI memory extraction returned empty content');
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(content);
+  } catch (err) {
+    throw new Error(`OpenAI memory extraction returned invalid JSON: ${content}`);
+  }
+
+  return parsed;
+}
+
+async function enrichMemoryWithOpenAI(phone, latestUserText) {
+  const memory = await getContactMemory(phone);
+  const patch = await callOpenAIMemoryExtractor({ phone, latestUserText });
+
+  const profile = patch.profile || {};
+
+  if (profile.name) {
+    memory.profile.name = profile.name.trim();
+  }
+  if (profile.relationship) {
+    memory.profile.relationship = profile.relationship.trim();
+  }
+  if (profile.company) {
+    memory.profile.company = profile.company.trim();
+  }
+
+  memory.preferences = dedupeStrings([
+    ...memory.preferences,
+    ...(Array.isArray(patch.preferences_add) ? patch.preferences_add : []),
+  ]);
+
+  memory.facts = dedupeStrings([
+    ...memory.facts,
+    ...(Array.isArray(patch.facts_add) ? patch.facts_add : []),
+  ]);
+
+  memory.open_loops = dedupeStrings([
+    ...memory.open_loops,
+    ...(Array.isArray(patch.open_loops_add) ? patch.open_loops_add : []),
+  ]);
+
+  memory.notes = appendUniqueNote(memory.notes, patch.notes_add || '');
+  memory.summary = String(patch.summary || memory.summary || '').trim();
+  memory.lead_status = String(patch.lead_status || memory.lead_status || 'unknown').trim() || 'unknown';
+  memory.lead_score = clampInt(patch.lead_score ?? memory.lead_score ?? 0, 0, 100);
+  memory.last_intent = String(patch.last_intent || memory.last_intent || '').trim();
+  memory.next_action = String(patch.next_action || memory.next_action || '').trim();
+  memory.last_extracted_at = new Date().toISOString();
+
+  await saveContactMemory(memory);
+}
+
 async function buildMemoryContext(phone) {
   const memory = await getContactMemory(phone);
 
@@ -289,6 +603,11 @@ async function buildMemoryContext(phone) {
     `Facts: ${memory.facts.length ? memory.facts.join(' | ') : 'none yet'}`,
     `Open loops: ${memory.open_loops.length ? memory.open_loops.join(' | ') : 'none yet'}`,
     `Notes: ${memory.notes || 'none yet'}`,
+    `Summary: ${memory.summary || 'none yet'}`,
+    `Lead status: ${memory.lead_status || 'unknown'}`,
+    `Lead score: ${memory.lead_score || 0}`,
+    `Last intent: ${memory.last_intent || 'unknown'}`,
+    `Next action: ${memory.next_action || 'none yet'}`,
     'Recent conversation:',
     recentMessages || 'No recent conversation yet.',
     'End private memory context.',
@@ -409,6 +728,7 @@ async function askElevenLabsText({ userText, fromNumber }) {
               metadata: {
                 sms_from: fromNumber,
                 memory_enabled: true,
+                openai_memory_enabled: true,
               },
             },
           })
@@ -486,7 +806,7 @@ app.get('/healthz', (_req, res) => {
 });
 
 app.get('/', (_req, res) => {
-  res.send('AI Steve SMS bridge with Postgres memory is live');
+  res.send('AI Steve SMS bridge with OpenAI memory + Postgres is live');
 });
 
 app.get('/memory/:phone', async (req, res) => {
@@ -508,6 +828,26 @@ app.post('/memory/:phone', async (req, res) => {
 
     if (typeof updates.notes === 'string') {
       memory.notes = updates.notes.trim();
+    }
+
+    if (typeof updates.summary === 'string') {
+      memory.summary = updates.summary.trim();
+    }
+
+    if (typeof updates.lead_status === 'string') {
+      memory.lead_status = updates.lead_status.trim();
+    }
+
+    if (typeof updates.lead_score !== 'undefined') {
+      memory.lead_score = clampInt(updates.lead_score, 0, 100);
+    }
+
+    if (typeof updates.last_intent === 'string') {
+      memory.last_intent = updates.last_intent.trim();
+    }
+
+    if (typeof updates.next_action === 'string') {
+      memory.next_action = updates.next_action.trim();
     }
 
     if (typeof updates.profile?.name === 'string') {
@@ -562,7 +902,13 @@ app.post('/sms', async (req, res) => {
   try {
     await updateLastSeen(from);
     await appendMessage(from, 'user', body);
-    await maybeExtractFacts(from, body);
+
+    try {
+      await enrichMemoryWithOpenAI(from, body);
+    } catch (openAiErr) {
+      console.error('OpenAI memory extraction failed, falling back to heuristics:', openAiErr);
+      await heuristicExtractFacts(from, body);
+    }
 
     const aiReply = await askElevenLabsText({
       userText: body,
