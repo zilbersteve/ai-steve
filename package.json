@@ -3,11 +3,11 @@
   "version": "1.0.0",
   "type": "module",
   "dependencies": {
-    "express": "^4.18.2",
-    "twilio": "^4.23.0",
     "dotenv": "^16.4.5",
-    "ws": "^8.17.0",
-    "pg": "^8.11.5"
+    "express": "^4.18.2",
+    "pg": "^8.11.5",
+    "twilio": "^4.23.0",
+    "ws": "^8.17.0"
   },
   "scripts": {
     "start": "node server.js"
