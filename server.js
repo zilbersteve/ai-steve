@@ -16,6 +16,7 @@ const {
   TWILIO_ACCOUNT_SID,
   TWILIO_AUTH_TOKEN,
   TWILIO_PHONE_NUMBER,
+  TWILIO_MESSAGING_SERVICE_SID,
   PUBLIC_BASE_URL,
   SESSION_STORE_PATH = '.data/sms-sessions.json',
   MEMORY_STORE_PATH = '.data/memory-store.json',
@@ -24,14 +25,20 @@ const {
 if (!ELEVENLABS_API_KEY || !ELEVENLABS_AGENT_ID) {
   throw new Error('Missing ELEVENLABS_API_KEY or ELEVENLABS_AGENT_ID');
 }
-if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !TWILIO_PHONE_NUMBER) {
-  throw new Error('Missing TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, or TWILIO_PHONE_NUMBER');
+
+if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) {
+  throw new Error('Missing TWILIO_ACCOUNT_SID or TWILIO_AUTH_TOKEN');
+}
+
+if (!TWILIO_MESSAGING_SERVICE_SID && !TWILIO_PHONE_NUMBER) {
+  throw new Error('Missing TWILIO_MESSAGING_SERVICE_SID or TWILIO_PHONE_NUMBER');
 }
 
 const twilioClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 
 const sessionStorePath = path.resolve(SESSION_STORE_PATH);
 const memoryStorePath = path.resolve(MEMORY_STORE_PATH);
+
 fs.mkdirSync(path.dirname(sessionStorePath), { recursive: true });
 fs.mkdirSync(path.dirname(memoryStorePath), { recursive: true });
 
@@ -86,13 +93,13 @@ function dedupeStrings(values) {
 
 function appendMessage(phone, role, text) {
   const memory = getContactMemory(phone);
+
   memory.messages.push({
     role,
     text: String(text || '').trim(),
     ts: new Date().toISOString(),
   });
 
-  // Keep only the most recent 24 messages (12 back-and-forth turns).
   if (memory.messages.length > 24) {
     memory.messages = memory.messages.slice(-24);
   }
@@ -120,16 +127,29 @@ function maybeExtractFacts(phone, userText) {
 
   const likeMatch = text.match(/\b(?:i like|i love|i prefer)\s+(.{1,80})/i);
   if (likeMatch) {
-    memory.preferences = dedupeStrings([...memory.preferences, likeMatch[1].trim().replace(/[.!?]+$/, '')]);
+    memory.preferences = dedupeStrings([
+      ...memory.preferences,
+      likeMatch[1].trim().replace(/[.!?]+$/, ''),
+    ]);
   }
 
   const rememberMatch = text.match(/\bremember(?: that)?\s+(.{1,140})/i);
   if (rememberMatch) {
-    memory.facts = dedupeStrings([...memory.facts, rememberMatch[1].trim().replace(/[.!?]+$/, '')]);
+    memory.facts = dedupeStrings([
+      ...memory.facts,
+      rememberMatch[1].trim().replace(/[.!?]+$/, ''),
+    ]);
   }
 
-  if (lower.includes('follow up') || lower.includes('circle back') || lower.includes('remind me')) {
-    memory.open_loops = dedupeStrings([...memory.open_loops, text.replace(/[.!?]+$/, '')]);
+  if (
+    lower.includes('follow up') ||
+    lower.includes('circle back') ||
+    lower.includes('remind me')
+  ) {
+    memory.open_loops = dedupeStrings([
+      ...memory.open_loops,
+      text.replace(/[.!?]+$/, ''),
+    ]);
   }
 
   memory.updatedAt = new Date().toISOString();
@@ -138,6 +158,7 @@ function maybeExtractFacts(phone, userText) {
 
 function buildMemoryContext(phone) {
   const memory = getContactMemory(phone);
+
   const recentMessages = memory.messages
     .slice(-12)
     .map((m) => `${m.role === 'user' ? 'Contact' : 'Steve'}: ${m.text}`)
@@ -176,9 +197,11 @@ async function getSignedUrl(agentId) {
   }
 
   const data = await res.json();
+
   if (!data.signed_url) {
     throw new Error('ElevenLabs did not return signed_url');
   }
+
   return data.signed_url;
 }
 
@@ -239,7 +262,7 @@ function waitForAgentReply(ws, timeoutMs = 45000) {
           resolve(String(nestedText).trim());
         }
       } catch {
-        // ignore frames that are not relevant
+        // ignore non-relevant frames
       }
     }
 
@@ -302,14 +325,17 @@ async function askElevenLabsText({ userText, fromNumber }) {
 
 function splitSms(text, maxLen = 1400) {
   if (text.length <= maxLen) return [text];
+
   const parts = [];
   let remaining = text;
+
   while (remaining.length > maxLen) {
     let idx = remaining.lastIndexOf(' ', maxLen);
     if (idx < 1) idx = maxLen;
     parts.push(remaining.slice(0, idx).trim());
     remaining = remaining.slice(idx).trim();
   }
+
   if (remaining) parts.push(remaining);
   return parts;
 }
@@ -317,20 +343,35 @@ function splitSms(text, maxLen = 1400) {
 async function sendSms(to, body) {
   const parts = splitSms(body);
   const sent = [];
+
   for (const part of parts) {
-    const msg = await twilioClient.messages.create({
-      from: TWILIO_PHONE_NUMBER,
+    const payload = {
       to,
       body: part,
-      statusCallback: PUBLIC_BASE_URL ? `${PUBLIC_BASE_URL}/twilio/status` : undefined,
-    });
+      statusCallback: PUBLIC_BASE_URL
+        ? `${PUBLIC_BASE_URL}/twilio/status`
+        : undefined,
+    };
+
+    if (TWILIO_MESSAGING_SERVICE_SID) {
+      payload.messagingServiceSid = TWILIO_MESSAGING_SERVICE_SID;
+    } else {
+      payload.from = TWILIO_PHONE_NUMBER;
+    }
+
+    const msg = await twilioClient.messages.create(payload);
     sent.push(msg.sid);
   }
+
   return sent;
 }
 
 app.get('/healthz', (_req, res) => {
   res.json({ ok: true });
+});
+
+app.get('/', (_req, res) => {
+  res.send('AI Steve SMS bridge is live');
 });
 
 app.get('/memory/:phone', (req, res) => {
@@ -341,18 +382,48 @@ app.get('/memory/:phone', (req, res) => {
 app.post('/memory/:phone', (req, res) => {
   const phone = normalizePhone(req.params.phone);
   const memory = getContactMemory(phone);
-
   const updates = req.body || {};
-  if (typeof updates.notes === 'string') memory.notes = updates.notes.trim();
-  if (typeof updates.profile?.name === 'string') memory.profile.name = updates.profile.name.trim();
-  if (typeof updates.profile?.relationship === 'string') memory.profile.relationship = updates.profile.relationship.trim();
-  if (typeof updates.profile?.company === 'string') memory.profile.company = updates.profile.company.trim();
-  if (Array.isArray(updates.preferences)) memory.preferences = dedupeStrings([...memory.preferences, ...updates.preferences]);
-  if (Array.isArray(updates.facts)) memory.facts = dedupeStrings([...memory.facts, ...updates.facts]);
-  if (Array.isArray(updates.open_loops)) memory.open_loops = dedupeStrings([...memory.open_loops, ...updates.open_loops]);
+
+  if (typeof updates.notes === 'string') {
+    memory.notes = updates.notes.trim();
+  }
+
+  if (typeof updates.profile?.name === 'string') {
+    memory.profile.name = updates.profile.name.trim();
+  }
+
+  if (typeof updates.profile?.relationship === 'string') {
+    memory.profile.relationship = updates.profile.relationship.trim();
+  }
+
+  if (typeof updates.profile?.company === 'string') {
+    memory.profile.company = updates.profile.company.trim();
+  }
+
+  if (Array.isArray(updates.preferences)) {
+    memory.preferences = dedupeStrings([
+      ...memory.preferences,
+      ...updates.preferences,
+    ]);
+  }
+
+  if (Array.isArray(updates.facts)) {
+    memory.facts = dedupeStrings([
+      ...memory.facts,
+      ...updates.facts,
+    ]);
+  }
+
+  if (Array.isArray(updates.open_loops)) {
+    memory.open_loops = dedupeStrings([
+      ...memory.open_loops,
+      ...updates.open_loops,
+    ]);
+  }
 
   memory.updatedAt = new Date().toISOString();
   saveMemoryStore();
+
   res.json({ ok: true, memory });
 });
 
@@ -385,6 +456,7 @@ app.post('/sms', async (req, res) => {
     await sendSms(from, aiReply);
   } catch (err) {
     console.error('SMS bridge error:', err);
+
     await sendSms(
       from,
       'yo… something glitched on my side. send that again in a sec.'
