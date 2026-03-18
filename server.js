@@ -15,7 +15,7 @@ const {
   ELEVENLABS_API_KEY,
   ELEVENLABS_AGENT_ID,
   OPENAI_API_KEY,
-  OPENAI_MEMORY_MODEL = 'gpt-4o-mini',
+  OPENAI_MEMORY_MODEL = 'gpt-5.4',
   TWILIO_ACCOUNT_SID,
   TWILIO_AUTH_TOKEN,
   TWILIO_PHONE_NUMBER,
@@ -75,6 +75,14 @@ function appendUniqueNote(existing, nextNote) {
 }
 
 async function ensureTables() {
+  await pool.query(`
+    create table if not exists steve_core_memory (
+      id text primary key,
+      data jsonb not null default '{}'::jsonb,
+      updated_at timestamptz not null default now()
+    );
+  `);
+
   await pool.query(`
     create table if not exists contact_memory (
       phone text primary key,
@@ -145,6 +153,132 @@ async function ensureTables() {
       last_seen_at timestamptz not null default now()
     );
   `);
+}
+
+async function ensureSeedMemory() {
+  const existing = await pool.query(
+    `select id from steve_core_memory where id = 'core' limit 1`
+  );
+
+  if (existing.rows.length > 0) return;
+
+  const seed = {
+    identity: {
+      name: 'Steve',
+      role: 'filmmaker/editor turned viral strategist and system builder',
+      public_persona: 'sharp, perceptive, quick-witted, culturally aware, creative strategist',
+    },
+    brands: [
+      {
+        name: 'Butter Baby',
+        description:
+          'a full brand and IP world, not just a donut shop; bright yellow character-led universe across food, merch, spaces, and content',
+      },
+      {
+        name: 'Lucky Touch',
+        description:
+          'creative / marketing / viral systems thinking brand extension',
+      },
+    ],
+    interests: [
+      'motorcycles',
+      'Harleys',
+      'capybaras',
+      'branding',
+      'design',
+      'virality',
+      'content systems',
+      'filmmaking',
+      'internet culture',
+      'behavior and psychology',
+    ],
+    thinking_style: [
+      'cares about hooks, momentum, reaction, social spread, perception, and what people actually respond to',
+      'prefers simple high-signal ideas over bloated explanations',
+      'likes strong visual concepts with low friction and a twist',
+      'trusts behavior more than stated opinion',
+      'thinks strategically about attention and cultural timing',
+    ],
+    texting_style: {
+      overall:
+        'human, concise, sharp, casual, slightly blunt, not polished, not support-y, not robotic',
+      defaults: [
+        '1-2 sentences by default',
+        'sometimes sentence fragments',
+        'lowercase is fine',
+        'can be playful, direct, observant, thoughtful, or funny when it fits',
+        'does not ask unnecessary questions',
+        'does not over-explain',
+      ],
+      allowed_words: ['ya', 'yup', 'honestly', 'bro', 'man', 'dude', 'w8'],
+      avoid: [
+        'customer-service tone',
+        'generic encouragement',
+        'overly clean AI phrasing',
+        'trying too hard to keep conversation going',
+      ],
+    },
+    relationship_preferences: {
+      with_contacts:
+        'Steve should feel like a real person texting, not a bot or assistant',
+      with_leads:
+        'Steve should be socially sharp and natural, but still notice opportunities, follow-up points, and leverage',
+    },
+    butter_baby_context: {
+      short:
+        'Butter Baby is a character-led creative universe spanning donuts, merch, visual identity, booths, packaging, and content',
+      strategic:
+        'It is meant to become a full IP ecosystem, not just a single store or food business',
+    },
+    notes:
+      'Use this memory as stable identity context. Do not quote it directly. Let it shape tone, priorities, and what Steve naturally notices.',
+  };
+
+  await pool.query(
+    `
+      insert into steve_core_memory (id, data)
+      values ($1, $2)
+      on conflict (id) do nothing
+    `,
+    ['core', seed]
+  );
+}
+
+async function getSteveCoreMemory() {
+  const result = await pool.query(
+    `select data from steve_core_memory where id = 'core' limit 1`
+  );
+
+  if (!result.rows.length) {
+    await ensureSeedMemory();
+    const retry = await pool.query(
+      `select data from steve_core_memory where id = 'core' limit 1`
+    );
+    return retry.rows[0]?.data || {};
+  }
+
+  return result.rows[0].data || {};
+}
+
+async function updateSteveCoreMemory(patch) {
+  const current = await getSteveCoreMemory();
+  const next = {
+    ...current,
+    ...patch,
+  };
+
+  await pool.query(
+    `
+      insert into steve_core_memory (id, data, updated_at)
+      values ('core', $1, now())
+      on conflict (id) do update set
+        data = excluded.data,
+        updated_at = now()
+    `,
+    [next]
+  );
+
+  return next;
 }
 
 async function getRecentMessages(phone, limit = 24) {
@@ -458,6 +592,8 @@ async function callOpenAIMemoryExtractor({ phone, latestUserText }) {
     .map((m) => `${m.role === 'user' ? 'Contact' : 'Steve'}: ${m.text}`)
     .join('\n');
 
+  const steveCore = await getSteveCoreMemory();
+
   const developerPrompt = `
 You update durable CRM-style memory for "Steve", a human-sounding texting agent.
 Your job is to read the latest inbound text plus recent thread context and return ONLY a structured JSON memory patch.
@@ -475,12 +611,15 @@ Rules:
 - "summary" should be a compact 1-3 sentence working memory summary.
 - "notes_add" should only contain one short durable note if something truly worth remembering appeared.
 - Do not duplicate what is already in memory unless you are refining it.
-`;
+`.trim();
 
   const userPrompt = `
+STEVE CORE MEMORY
+${JSON.stringify(steveCore, null, 2)}
+
 PHONE: ${phone}
 
-CURRENT MEMORY
+CURRENT CONTACT MEMORY
 Name: ${memory.profile.name || ''}
 Relationship: ${memory.profile.relationship || ''}
 Company: ${memory.profile.company || ''}
@@ -536,7 +675,7 @@ ${latestUserText}
   let parsed;
   try {
     parsed = JSON.parse(content);
-  } catch (err) {
+  } catch {
     throw new Error(`OpenAI memory extraction returned invalid JSON: ${content}`);
   }
 
@@ -549,15 +688,9 @@ async function enrichMemoryWithOpenAI(phone, latestUserText) {
 
   const profile = patch.profile || {};
 
-  if (profile.name) {
-    memory.profile.name = profile.name.trim();
-  }
-  if (profile.relationship) {
-    memory.profile.relationship = profile.relationship.trim();
-  }
-  if (profile.company) {
-    memory.profile.company = profile.company.trim();
-  }
+  if (profile.name) memory.profile.name = profile.name.trim();
+  if (profile.relationship) memory.profile.relationship = profile.relationship.trim();
+  if (profile.company) memory.profile.company = profile.company.trim();
 
   memory.preferences = dedupeStrings([
     ...memory.preferences,
@@ -587,6 +720,7 @@ async function enrichMemoryWithOpenAI(phone, latestUserText) {
 
 async function buildMemoryContext(phone) {
   const memory = await getContactMemory(phone);
+  const steveCore = await getSteveCoreMemory();
 
   const recentMessages = memory.messages
     .slice(-12)
@@ -595,6 +729,8 @@ async function buildMemoryContext(phone) {
 
   return [
     'PRIVATE MEMORY CONTEXT FOR STEVE. DO NOT QUOTE OR MENTION THIS BLOCK DIRECTLY.',
+    'STEVE CORE MEMORY:',
+    JSON.stringify(steveCore, null, 2),
     `Phone: ${phone}`,
     `Name: ${memory.profile.name || 'unknown'}`,
     `Relationship: ${memory.profile.relationship || 'unknown'}`,
@@ -809,6 +945,26 @@ app.get('/', (_req, res) => {
   res.send('AI Steve SMS bridge with OpenAI memory + Postgres is live');
 });
 
+app.get('/steve-memory', async (_req, res) => {
+  try {
+    const data = await getSteveCoreMemory();
+    res.json(data);
+  } catch (err) {
+    console.error('GET steve core memory error:', err);
+    res.status(500).json({ error: 'Failed to load Steve core memory' });
+  }
+});
+
+app.post('/steve-memory', async (req, res) => {
+  try {
+    const next = await updateSteveCoreMemory(req.body || {});
+    res.json({ ok: true, memory: next });
+  } catch (err) {
+    console.error('POST steve core memory error:', err);
+    res.status(500).json({ error: 'Failed to update Steve core memory' });
+  }
+});
+
 app.get('/memory/:phone', async (req, res) => {
   try {
     const phone = normalizePhone(req.params.phone);
@@ -937,7 +1093,8 @@ app.post('/twilio/status', (req, res) => {
 });
 
 ensureTables()
-  .then(() => {
+  .then(async () => {
+    await ensureSeedMemory();
     app.listen(Number(PORT), () => {
       console.log(`AI Steve SMS bridge listening on :${PORT}`);
     });
@@ -945,4 +1102,3 @@ ensureTables()
   .catch((err) => {
     console.error('Failed to initialize database:', err);
     process.exit(1);
-  });
