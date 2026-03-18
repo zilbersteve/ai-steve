@@ -1,9 +1,10 @@
 import 'dotenv/config';
 import express from 'express';
 import twilio from 'twilio';
-import fs from 'node:fs';
-import path from 'node:path';
+import pg from 'pg';
 import { WebSocket } from 'ws';
+
+const { Pool } = pg;
 
 const app = express();
 app.use(express.urlencoded({ extended: false }));
@@ -18,8 +19,7 @@ const {
   TWILIO_PHONE_NUMBER,
   TWILIO_MESSAGING_SERVICE_SID,
   PUBLIC_BASE_URL,
-  SESSION_STORE_PATH = '.data/sms-sessions.json',
-  MEMORY_STORE_PATH = '.data/memory-store.json',
+  DATABASE_URL,
 } = process.env;
 
 if (!ELEVENLABS_API_KEY || !ELEVENLABS_AGENT_ID) {
@@ -34,82 +34,198 @@ if (!TWILIO_MESSAGING_SERVICE_SID && !TWILIO_PHONE_NUMBER) {
   throw new Error('Missing TWILIO_MESSAGING_SERVICE_SID or TWILIO_PHONE_NUMBER');
 }
 
+if (!DATABASE_URL) {
+  throw new Error('Missing DATABASE_URL');
+}
+
 const twilioClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 
-const sessionStorePath = path.resolve(SESSION_STORE_PATH);
-const memoryStorePath = path.resolve(MEMORY_STORE_PATH);
-
-fs.mkdirSync(path.dirname(sessionStorePath), { recursive: true });
-fs.mkdirSync(path.dirname(memoryStorePath), { recursive: true });
-
-function loadJson(filePath, fallback = {}) {
-  if (!fs.existsSync(filePath)) return fallback;
-  return JSON.parse(fs.readFileSync(filePath, 'utf8'));
-}
-
-function saveJson(filePath, value) {
-  fs.writeFileSync(filePath, JSON.stringify(value, null, 2));
-}
-
-const sessionStore = loadJson(sessionStorePath, {});
-const memoryStore = loadJson(memoryStorePath, {});
-
-function saveSessionStore() {
-  saveJson(sessionStorePath, sessionStore);
-}
-
-function saveMemoryStore() {
-  saveJson(memoryStorePath, memoryStore);
-}
+const pool = new Pool({
+  connectionString: DATABASE_URL,
+  ssl: { rejectUnauthorized: false },
+});
 
 function normalizePhone(input) {
   return String(input || '').trim();
-}
-
-function getContactMemory(phone) {
-  if (!memoryStore[phone]) {
-    memoryStore[phone] = {
-      phone,
-      profile: {
-        name: '',
-        relationship: '',
-        company: '',
-      },
-      preferences: [],
-      facts: [],
-      open_loops: [],
-      notes: '',
-      messages: [],
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-    };
-  }
-  return memoryStore[phone];
 }
 
 function dedupeStrings(values) {
   return [...new Set(values.map((v) => String(v).trim()).filter(Boolean))];
 }
 
-function appendMessage(phone, role, text) {
-  const memory = getContactMemory(phone);
+async function ensureTables() {
+  await pool.query(`
+    create table if not exists contact_memory (
+      phone text primary key,
+      profile jsonb not null default '{}'::jsonb,
+      preferences jsonb not null default '[]'::jsonb,
+      facts jsonb not null default '[]'::jsonb,
+      open_loops jsonb not null default '[]'::jsonb,
+      notes text not null default '',
+      created_at timestamptz not null default now(),
+      updated_at timestamptz not null default now()
+    );
+  `);
 
-  memory.messages.push({
-    role,
-    text: String(text || '').trim(),
-    ts: new Date().toISOString(),
-  });
+  await pool.query(`
+    create table if not exists contact_messages (
+      id bigserial primary key,
+      phone text not null,
+      role text not null,
+      text text not null,
+      ts timestamptz not null default now()
+    );
+  `);
 
-  if (memory.messages.length > 24) {
-    memory.messages = memory.messages.slice(-24);
-  }
+  await pool.query(`
+    create index if not exists idx_contact_messages_phone_ts
+    on contact_messages (phone, ts desc);
+  `);
 
-  memory.updatedAt = new Date().toISOString();
-  saveMemoryStore();
+  await pool.query(`
+    create table if not exists sms_sessions (
+      phone text primary key,
+      last_seen_at timestamptz not null default now()
+    );
+  `);
 }
 
-function maybeExtractFacts(phone, userText) {
-  const memory = getContactMemory(phone);
+async function getRecentMessages(phone, limit = 24) {
+  const result = await pool.query(
+    `
+      select role, text, ts
+      from contact_messages
+      where phone = $1
+      order by ts desc
+      limit $2
+    `,
+    [phone, limit]
+  );
+
+  return result.rows.reverse().map((r) => ({
+    role: r.role,
+    text: r.text,
+    ts: r.ts,
+  }));
+}
+
+async function getContactMemory(phone) {
+  const result = await pool.query(
+    `
+      select phone, profile, preferences, facts, open_loops, notes, created_at, updated_at
+      from contact_memory
+      where phone = $1
+    `,
+    [phone]
+  );
+
+  if (result.rows.length > 0) {
+    const row = result.rows[0];
+    return {
+      phone: row.phone,
+      profile: row.profile || { name: '', relationship: '', company: '' },
+      preferences: row.preferences || [],
+      facts: row.facts || [],
+      open_loops: row.open_loops || [],
+      notes: row.notes || '',
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+      messages: await getRecentMessages(phone),
+    };
+  }
+
+  const fresh = {
+    phone,
+    profile: { name: '', relationship: '', company: '' },
+    preferences: [],
+    facts: [],
+    open_loops: [],
+    notes: '',
+  };
+
+  await pool.query(
+    `
+      insert into contact_memory (phone, profile, preferences, facts, open_loops, notes)
+      values ($1, $2, $3, $4, $5, $6)
+      on conflict (phone) do nothing
+    `,
+    [
+      fresh.phone,
+      fresh.profile,
+      fresh.preferences,
+      fresh.facts,
+      fresh.open_loops,
+      fresh.notes,
+    ]
+  );
+
+  return {
+    ...fresh,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    messages: [],
+  };
+}
+
+async function saveContactMemory(memory) {
+  await pool.query(
+    `
+      insert into contact_memory
+        (phone, profile, preferences, facts, open_loops, notes, updated_at)
+      values
+        ($1, $2, $3, $4, $5, $6, now())
+      on conflict (phone) do update set
+        profile = excluded.profile,
+        preferences = excluded.preferences,
+        facts = excluded.facts,
+        open_loops = excluded.open_loops,
+        notes = excluded.notes,
+        updated_at = now()
+    `,
+    [
+      memory.phone,
+      memory.profile,
+      memory.preferences,
+      memory.facts,
+      memory.open_loops,
+      memory.notes,
+    ]
+  );
+}
+
+async function appendMessage(phone, role, text) {
+  await pool.query(
+    `
+      insert into contact_messages (phone, role, text)
+      values ($1, $2, $3)
+    `,
+    [phone, role, String(text || '').trim()]
+  );
+
+  await pool.query(
+    `
+      update contact_memory
+      set updated_at = now()
+      where phone = $1
+    `,
+    [phone]
+  );
+}
+
+async function updateLastSeen(phone) {
+  await pool.query(
+    `
+      insert into sms_sessions (phone, last_seen_at)
+      values ($1, now())
+      on conflict (phone) do update set
+        last_seen_at = now()
+    `,
+    [phone]
+  );
+}
+
+async function maybeExtractFacts(phone, userText) {
+  const memory = await getContactMemory(phone);
   const text = String(userText || '').trim();
   if (!text) return;
 
@@ -152,12 +268,11 @@ function maybeExtractFacts(phone, userText) {
     ]);
   }
 
-  memory.updatedAt = new Date().toISOString();
-  saveMemoryStore();
+  await saveContactMemory(memory);
 }
 
-function buildMemoryContext(phone) {
-  const memory = getContactMemory(phone);
+async function buildMemoryContext(phone) {
+  const memory = await getContactMemory(phone);
 
   const recentMessages = memory.messages
     .slice(-12)
@@ -274,7 +389,7 @@ function waitForAgentReply(ws, timeoutMs = 45000) {
 
 async function askElevenLabsText({ userText, fromNumber }) {
   const signedUrl = await getSignedUrl(ELEVENLABS_AGENT_ID);
-  const memoryContext = buildMemoryContext(fromNumber);
+  const memoryContext = await buildMemoryContext(fromNumber);
   const prompt = `${memoryContext}\n\nLatest inbound text from the contact:\n${userText}`;
 
   return await new Promise((resolve, reject) => {
@@ -371,60 +486,69 @@ app.get('/healthz', (_req, res) => {
 });
 
 app.get('/', (_req, res) => {
-  res.send('AI Steve SMS bridge is live');
+  res.send('AI Steve SMS bridge with Postgres memory is live');
 });
 
-app.get('/memory/:phone', (req, res) => {
-  const phone = normalizePhone(req.params.phone);
-  res.json(getContactMemory(phone));
+app.get('/memory/:phone', async (req, res) => {
+  try {
+    const phone = normalizePhone(req.params.phone);
+    const memory = await getContactMemory(phone);
+    res.json(memory);
+  } catch (err) {
+    console.error('GET memory error:', err);
+    res.status(500).json({ error: 'Failed to load memory' });
+  }
 });
 
-app.post('/memory/:phone', (req, res) => {
-  const phone = normalizePhone(req.params.phone);
-  const memory = getContactMemory(phone);
-  const updates = req.body || {};
+app.post('/memory/:phone', async (req, res) => {
+  try {
+    const phone = normalizePhone(req.params.phone);
+    const memory = await getContactMemory(phone);
+    const updates = req.body || {};
 
-  if (typeof updates.notes === 'string') {
-    memory.notes = updates.notes.trim();
+    if (typeof updates.notes === 'string') {
+      memory.notes = updates.notes.trim();
+    }
+
+    if (typeof updates.profile?.name === 'string') {
+      memory.profile.name = updates.profile.name.trim();
+    }
+
+    if (typeof updates.profile?.relationship === 'string') {
+      memory.profile.relationship = updates.profile.relationship.trim();
+    }
+
+    if (typeof updates.profile?.company === 'string') {
+      memory.profile.company = updates.profile.company.trim();
+    }
+
+    if (Array.isArray(updates.preferences)) {
+      memory.preferences = dedupeStrings([
+        ...memory.preferences,
+        ...updates.preferences,
+      ]);
+    }
+
+    if (Array.isArray(updates.facts)) {
+      memory.facts = dedupeStrings([
+        ...memory.facts,
+        ...updates.facts,
+      ]);
+    }
+
+    if (Array.isArray(updates.open_loops)) {
+      memory.open_loops = dedupeStrings([
+        ...memory.open_loops,
+        ...updates.open_loops,
+      ]);
+    }
+
+    await saveContactMemory(memory);
+    res.json({ ok: true, memory });
+  } catch (err) {
+    console.error('POST memory error:', err);
+    res.status(500).json({ error: 'Failed to update memory' });
   }
-
-  if (typeof updates.profile?.name === 'string') {
-    memory.profile.name = updates.profile.name.trim();
-  }
-
-  if (typeof updates.profile?.relationship === 'string') {
-    memory.profile.relationship = updates.profile.relationship.trim();
-  }
-
-  if (typeof updates.profile?.company === 'string') {
-    memory.profile.company = updates.profile.company.trim();
-  }
-
-  if (Array.isArray(updates.preferences)) {
-    memory.preferences = dedupeStrings([
-      ...memory.preferences,
-      ...updates.preferences,
-    ]);
-  }
-
-  if (Array.isArray(updates.facts)) {
-    memory.facts = dedupeStrings([
-      ...memory.facts,
-      ...updates.facts,
-    ]);
-  }
-
-  if (Array.isArray(updates.open_loops)) {
-    memory.open_loops = dedupeStrings([
-      ...memory.open_loops,
-      ...updates.open_loops,
-    ]);
-  }
-
-  memory.updatedAt = new Date().toISOString();
-  saveMemoryStore();
-
-  res.json({ ok: true, memory });
 });
 
 app.post('/sms', async (req, res) => {
@@ -435,16 +559,11 @@ app.post('/sms', async (req, res) => {
 
   if (!from || !body) return;
 
-  sessionStore[from] = {
-    ...(sessionStore[from] || {}),
-    lastSeenAt: new Date().toISOString(),
-  };
-  saveSessionStore();
-
-  appendMessage(from, 'user', body);
-  maybeExtractFacts(from, body);
-
   try {
+    await updateLastSeen(from);
+    await appendMessage(from, 'user', body);
+    await maybeExtractFacts(from, body);
+
     const aiReply = await askElevenLabsText({
       userText: body,
       fromNumber: from,
@@ -452,7 +571,7 @@ app.post('/sms', async (req, res) => {
 
     if (!aiReply) return;
 
-    appendMessage(from, 'assistant', aiReply);
+    await appendMessage(from, 'assistant', aiReply);
     await sendSms(from, aiReply);
   } catch (err) {
     console.error('SMS bridge error:', err);
@@ -471,6 +590,13 @@ app.post('/twilio/status', (req, res) => {
   res.sendStatus(204);
 });
 
-app.listen(Number(PORT), () => {
-  console.log(`AI Steve SMS bridge listening on :${PORT}`);
-});
+ensureTables()
+  .then(() => {
+    app.listen(Number(PORT), () => {
+      console.log(`AI Steve SMS bridge listening on :${PORT}`);
+    });
+  })
+  .catch((err) => {
+    console.error('Failed to initialize database:', err);
+    process.exit(1);
+  });
