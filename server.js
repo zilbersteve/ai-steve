@@ -11,46 +11,53 @@ app.get("/", (req, res) => {
   res.send("AI Steve is live");
 });
 
-async function handleVoice(req, res) {
-  try {
-    const response = await fetch(
-      `https://api.elevenlabs.io/v1/text-to-speech/${VOICE_ID}`,
-      {
-        method: "POST",
-        headers: {
-          "xi-api-key": ELEVEN_API_KEY,
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          text: "what up",
-          model_id: "eleven_multilingual_v2"
-        })
-      }
-    );
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      console.error("ElevenLabs error:", errorText);
-      return res.status(500).send("ElevenLabs request failed");
+async function generateAudio() {
+  const response = await fetch(
+    `https://api.elevenlabs.io/v1/text-to-speech/${VOICE_ID}`,
+    {
+      method: "POST",
+      headers: {
+        "xi-api-key": ELEVEN_API_KEY,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        text: "what up",
+        model_id: "eleven_multilingual_v2"
+      })
     }
+  );
 
-    const audioBuffer = await response.arrayBuffer();
-    const base64Audio = Buffer.from(audioBuffer).toString("base64");
-
-    res.type("text/xml");
-    res.send(`
-      <Response>
-        <Play>data:audio/mpeg;base64,${base64Audio}</Play>
-      </Response>
-    `);
-  } catch (err) {
-    console.error("Voice route error:", err);
-    res.status(500).send("Error");
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`ElevenLabs failed: ${errorText}`);
   }
+
+  const audioBuffer = await response.arrayBuffer();
+  return Buffer.from(audioBuffer);
 }
 
-app.get("/voice", handleVoice);
-app.post("/voice", handleVoice);
+app.get("/audio.mp3", async (req, res) => {
+  try {
+    const audio = await generateAudio();
+    res.set("Content-Type", "audio/mpeg");
+    res.send(audio);
+  } catch (err) {
+    console.error(err);
+    res.status(500).send("Audio generation failed");
+  }
+});
+
+function sendTwiML(req, res) {
+  res.type("text/xml");
+  res.send(`
+    <Response>
+      <Play>https://expressjs-postgres-production-91a9.up.railway.app/audio.mp3</Play>
+    </Response>
+  `);
+}
+
+app.get("/voice", sendTwiML);
+app.post("/voice", sendTwiML);
 
 app.listen(process.env.PORT || 3000, () => {
   console.log("Server running");
